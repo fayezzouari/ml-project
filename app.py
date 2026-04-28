@@ -18,6 +18,8 @@ from denoise import load_model, run_pass, noise_subtraction
 from utils.audio import (
     wav_to_mel,
     mel_to_wav,
+    mel_to_wav_hifigan,
+    load_hifigan,
     make_mel_transform,
     SAMPLE_RATE,
 )
@@ -38,9 +40,10 @@ def load(checkpoint_path: str):
     else:
         device = torch.device("cpu")
     print(f"Device: {device}")
-    model = load_model(checkpoint_path, device)
+    model   = load_model(checkpoint_path, device)
+    hifigan = load_hifigan(device)
     print(f"Model loaded from: {checkpoint_path}")
-    return model, device
+    return model, hifigan, device
 
 
 @torch.no_grad()
@@ -89,7 +92,8 @@ def denoise(audio_input, passes: int, ns_alpha: float, gate: float, griffin_iter
         threshold = float(np.percentile(current_spec.numpy(), gate))
         current_spec = current_spec.clamp(min=threshold)
 
-    clean_wav = mel_to_wav(current_spec, n_iter=griffin_iter)
+    clean_wav = mel_to_wav_hifigan(current_spec, HIFIGAN, DEVICE) if HIFIGAN is not None \
+        else mel_to_wav(current_spec, n_iter=griffin_iter)
 
     # Trim to original length
     original_len = wav.shape[-1]
@@ -147,6 +151,6 @@ def build_ui():
 
 if __name__ == "__main__":
     args = parse_args()
-    MODEL, DEVICE = load(args.checkpoint)
+    MODEL, HIFIGAN, DEVICE = load(args.checkpoint)
     demo = build_ui()
     demo.launch(share=args.share)
