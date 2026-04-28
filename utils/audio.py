@@ -27,6 +27,91 @@ N_MELS        = 128      # frequency bins (height of spectrogram image)
 F_MIN         = 20.0     # Hz
 F_MAX         = 8_000.0  # Hz
 
+# ── HiFi-GAN mel config (microsoft/speecht5_hifigan) ──────────────────────
+_HIFIGAN_N_MELS = 80
+_HIFIGAN_F_MIN  = 0.0
+_HIFIGAN_F_MAX  = SAMPLE_RATE / 2
+
+# Lazily built transforms for mel conversion (created once, reused)
+_INV_MEL_128: T.InverseMelScale | None = None
+_MEL_SCALE_80: T.MelScale | None = None
+
+
+def _get_mel_converters():
+    """
+    Lazily build and cache the two transforms used for 128-mel → 80-mel conversion.
+
+    InverseMelScale uses NNLS (non-negative least squares) to find the best
+    non-negative linear STFT spectrogram consistent with the observed 128-mel
+    spectrogram. MelScale then re-applies the 80-mel filterbank on top.
+    This is more accurate than the pseudo-inverse (pinv) matrix approach,
+    which can produce negative intermediate values and loses spectral shape.
+    """
+    global _INV_MEL_128, _MEL_SCALE_80
+    if _INV_MEL_128 is None:
+        _INV_MEL_128 = T.InverseMelScale(
+            n_stft=N_FFT // 2 + 1,
+            n_mels=N_MELS,
+            sample_rate=SAMPLE_RATE,
+            f_min=F_MIN,
+            f_max=F_MAX,
+        )
+    if _MEL_SCALE_80 is None:
+        _MEL_SCALE_80 = T.MelScale(
+            n_mels=_HIFIGAN_N_MELS,
+            sample_rate=SAMPLE_RATE,
+            f_min=_HIFIGAN_F_MIN,
+            f_max=_HIFIGAN_F_MAX,
+            n_stft=N_FFT // 2 + 1,
+        )
+    return _INV_MEL_128, _MEL_SCALE_80
+
+
+def load_hifigan(device: torch.device = torch.device("cpu")):
+    """Download and return the pretrained SpeechT5 HiFi-GAN vocoder."""
+    from transformers import SpeechT5HifiGan
+    print("Loading pretrained HiFi-GAN (microsoft/speecht5_hifigan)...")
+    model = SpeechT5HifiGan.from_pretrained("microsoft/speecht5_hifigan")
+    model.eval().to(device)
+    print("HiFi-GAN ready.")
+    return model
+
+
+@torch.no_grad()
+def mel_to_wav_hifigan(log_mel: torch.Tensor, hifigan, device: torch.device) -> torch.Tensor:
+    """
+    Convert a denoised 128-mel log1p spectrogram to a waveform using HiFi-GAN.
+
+    Pipeline:
+      log_mel (128, log1p) → power mel (128) → [NNLS] → linear STFT
+        → [MelScale] → power mel (80) → log → HiFi-GAN → waveform
+
+    The NNLS step enforces non-negativity and finds the linear spectrum that
+    best explains the observed mel values — much more accurate than pinv.
+
+    log_mel: (1, 128, T)
+    Returns: (1, T_audio)
+    """
+    inv_mel, mel_scale_80 = _get_mel_converters()
+
+    # 1. Undo log1p → power mel (128 bins)
+    mel_128 = torch.expm1(log_mel.float()).clamp(min=0)       # (1, 128, T)
+
+    # 2. 128-mel → linear STFT via NNLS  (513, T)
+    linear = inv_mel(mel_128.squeeze(0))                       # (513, T)
+
+    # 3. Linear → 80-mel (HiFi-GAN's native filterbank config)
+    mel_80 = mel_scale_80(linear.unsqueeze(0)).clamp(min=0)   # (1, 80, T)
+
+    # 4. Log-compress — matches HiFi-GAN training: log(mel + 1e-5)
+    log_mel_80 = torch.log(mel_80.clamp(min=1e-5))            # (1, 80, T)
+
+    # 5. HiFi-GAN expects (batch, time, n_mels)
+    mel_input = log_mel_80.squeeze(0).T.unsqueeze(0).to(device)  # (1, T, 80)
+
+    wav = hifigan(mel_input)                                   # (1, T_audio)
+    return wav.cpu()
+
 
 def load_audio(path: str | Path, target_sr: int = SAMPLE_RATE) -> torch.Tensor:
     """
