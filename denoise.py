@@ -24,6 +24,8 @@ from utils.audio import (
     load_audio,
     wav_to_mel,
     mel_to_wav,
+    mel_to_wav_hifigan,
+    load_hifigan,
     normalize_spec,
     denormalize_spec,
     make_mel_transform,
@@ -41,6 +43,8 @@ def parse_args():
     p.add_argument("--chunk-frames", type=int,   default=256, help="Spectrogram frames per chunk")
     p.add_argument("--hop-frames",   type=int,   default=64,  help="Hop between chunks — smaller = smoother")
     p.add_argument("--griffin-iter", type=int,   default=128, help="Griffin-Lim iterations (more = less artifact)")
+    p.add_argument("--vocoder",      type=str,   default="griffin-lim", choices=["griffin-lim", "hifigan"],
+                   help="Vocoder for spectrogram → waveform (hifigan = better quality, downloads ~50MB)")
     p.add_argument("--passes",       type=int,   default=2,   help="Number of denoising passes in spectrogram space")
     p.add_argument("--gate",         type=float, default=None, help="Zero out bins below this percentile (e.g. 15)")
     p.add_argument("--ns-alpha",     type=float, default=1.5, help="Noise subtraction strength (0=off, 1=subtract once, 2=aggressive)")
@@ -112,6 +116,8 @@ def denoise_file(
     passes: int = 2,
     gate: float | None = None,
     ns_alpha: float = 1.5,
+    vocoder: str = "griffin-lim",
+    hifigan=None,
 ):
     print(f"Loading: {input_path}")
     wav = load_audio(input_path)
@@ -143,8 +149,12 @@ def denoise_file(
         print(f"  Spectral gate: zeroed bins below {gate}th percentile ({threshold:.4f})")
 
     # ── 5. Spectrogram → waveform ─────────────────────────────────────────
-    print(f"  Griffin-Lim ({griffin_iter} iterations)...")
-    clean_wav = mel_to_wav(current_spec, n_iter=griffin_iter)
+    if vocoder == "hifigan" and hifigan is not None:
+        print("  HiFi-GAN vocoder...")
+        clean_wav = mel_to_wav_hifigan(current_spec, hifigan, device)
+    else:
+        print(f"  Griffin-Lim ({griffin_iter} iterations)...")
+        clean_wav = mel_to_wav(current_spec, n_iter=griffin_iter)
 
     # ── 6. Trim / pad to original length ──────────────────────────────────
     original_len = wav.shape[-1]
@@ -187,6 +197,10 @@ def main():
     model = load_model(args.checkpoint, device)
     print(f"Checkpoint: {args.checkpoint}")
 
+    hifigan = None
+    if args.vocoder == "hifigan":
+        hifigan = load_hifigan(device)
+
     denoise_file(
         input_path=args.input,
         output_path=args.output,
@@ -198,6 +212,8 @@ def main():
         passes=args.passes,
         gate=args.gate,
         ns_alpha=args.ns_alpha,
+        vocoder=args.vocoder,
+        hifigan=hifigan,
     )
 
 
